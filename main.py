@@ -1,98 +1,121 @@
-"""gta6-trophy-rarity-forecast-01's starter in Python 3.13 (standard library only): persistence.
+"""GTA VI trophy rarity forecaster.
 
-The same program as starter/main.ts (the house baseline), number for number: it forecasts that every trophy's earn rate
-on Exophase at the case's target is the rate in the case's last read, with a spread that widens like a random walk's on
-the logit scale:
+Reads one case (makefun/gta6-trophies-case/v1) and writes five quantiles of
+each trophy's earn rate at the case's target, minimising expected pinball
+loss on the logit scale.
 
-    q_tau = 100 / (1 + exp(-(logit(r) + z_tau * 0.5 * sqrt(d)))), rounded to 4 decimals (half up)
-
-for each trophy, where r is its rate in the last read of the case's history (percent, clamped to 0.01..99.99 before the
-logit), d the case's horizon in days (horizon_minutes / 1440) and z_tau the standard normal's quantile at each level
-(0.05, 0.25, 0.5, 0.75, 0.95): -1.645, -0.674, 0, 0.674, 1.645.
-
-How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in python:3.13-slim, standard library only: no
-network, no pip packages. -P keeps this file's directory OFF sys.path, so a module you ship beside main.py (say
-/bot/model.py) imports only after the sys.path line below, which puts the directory first; -s drops user
-site-packages.
-
-What an entry must do:
-  - read every <id>.in in the input directory (the grader runs one case at a time, with only that case's file there):
-    JSON {"schema": "makefun/gta6-trophies-case/v1", "id", "at", "horizon_minutes", "target", "levels", "game",
-    "trophies", "history", "notes"}, where `trophies` lists the case's trophies {id, name, description, tier, points,
-    secret} and `history` every read before `at`, oldest first, each {slot, at, players_tracked, trophies_earned,
-    rates}, `rates` in the order of `trophies` (null where that read lacked the trophy);
-  - write <id>.out to the output directory: {"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}, one row
-    for each of the case's trophies, each id once, no other key, each q five finite numbers from 0 to 100 (percent),
-    non-decreasing; at most 65,536 bytes. Anything else is an invalid case, scored as if every quantile equalled the
-    trophy's rate in the last read, and an entry with an invalid case takes no prize.
-
-Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output:
-    mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+Model, per trophy:
+  - logit-rate least-squares line on ln(1 + hours since 2026-11-19T00:00Z)
+    over the case's whole history (shrink the slope toward 0 — the log-time
+    curve flattens as the launch cohort saturates);
+  - predicted logit at the target's ln(1 + hours);
+  - spread = fit residual combined with a random-walk term that grows with
+    sqrt(days of horizon), floored so a quiet history stays honest;
+  - fewer than 3 usable reads: persistence with the same walk spread.
 """
-
 import json
 import math
 import os
-import sys
-from pathlib import Path
+from datetime import datetime, timezone
 
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-# The quantile levels the contest scores, in the order each row lists them.
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# The spread of a rate's move, in logit units per square-root day.
-SIGMA = 0.5
+Z = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
+EPOCH = datetime(2026, 11, 19, tzinfo=timezone.utc)
+LOGIT_FLOOR, LOGIT_CAP = 0.01, 99.99
+SHRINK_N = 4.0          # slope shrinkage: slope * n / (n + SHRINK_N)
+WALK_PER_DAY = 0.35     # logit spread added per sqrt(day of horizon)
+RESID_FLOOR = 0.15      # minimum residual spread
+GROWTH_RATIO = 0.35     # assumed rate ratio at target: earners grow far slower than the tracked pool
+FLAT_SPREAD = 1.6       # logit spread when the history carries no trend
 
 
-def clamp(x: float) -> float:
-    return min(99.99, max(0.01, x))
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def logit(pct: float) -> float:
-    return math.log(clamp(pct) / (100 - clamp(pct)))
+def hours_since(ts):
+    return (ts - EPOCH).total_seconds() / 3600.0
 
 
-def round4(x: float) -> float | int:
-    """x rounded to 4 decimals, half up, as JavaScript's Math.round(x * 10000) / 10000 rounds it.
-
-    A whole number comes back as an int, so json.dumps writes 100 where JavaScript writes 100 (not 100.0).
-    """
-    scaled = x * 10000
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000
-    return int(value) if value.is_integer() else value
+def logit(p):
+    p = min(max(p, LOGIT_FLOOR), LOGIT_CAP)
+    return math.log(p / (100.0 - p))
 
 
-def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    if not case["history"]:
-        raise ValueError(f"{name} has no history")
-    last = case["history"][-1]
-    spread = SIGMA * math.sqrt(case["horizon_minutes"] / 1440)
-    rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        rate = last["rates"][i]
-        lg = logit(rate if rate is not None else 0)
-        rows.append({"id": trophy["id"], "q": [round4(100 / (1 + math.exp(-(lg + z * spread)))) for z in Z]})
-    return {"trophies": rows}
+def inv_logit(x):
+    x = min(max(x, logit(LOGIT_FLOOR)), logit(LOGIT_CAP))
+    e = math.exp(x)
+    return 100.0 * e / (1.0 + e)
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+def fit_line(xs, ys):
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    slope = sxy / sxx if sxx > 0 else 0.0
+    intercept = my - slope * mx
+    resid = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+    var = sum(r * r for r in resid) / max(n - 2, 1)
+    return intercept, slope, math.sqrt(max(var, 0.0)), n
+
+
+def forecast_trophy(reads, idx, target_hours, target_x):
+    xs, ys = [], []
+    for r in reads:
+        rate = r["rates"][idx]
+        if rate is None:
+            continue
+        xs.append(math.log1p(hours_since(parse_ts(r["at"]))))
+        ys.append(logit(rate))
+    mu_trend, sigma_fit = None, None
+    if len(xs) >= 3 and max(xs) > min(xs):
+        intercept, slope, resid, n = fit_line(xs, ys)
+        if abs(slope) * (max(xs) - min(xs)) > 0.2 or resid > 0.2:
+            slope_eff = slope * n / (n + SHRINK_N)
+            mu_trend = intercept + slope_eff * target_x
+            sigma_fit = max(resid, RESID_FLOOR)
+    if mu_trend is not None:
+        mu = mu_trend
+        sigma = math.sqrt(sigma_fit ** 2
+                          + (WALK_PER_DAY * math.sqrt(target_hours / 24.0)) ** 2)
+    else:
+        # History carries no trend: the launch cohort is tiny and hardcore,
+        # so rates dilute as the tracked pool floods in over the horizon.
+        # Scale the last rate down and hedge with a wide logit spread.
+        base = inv_logit(ys[-1]) if ys else 1.0
+        mu = logit(base * GROWTH_RATIO)
+        sigma = math.sqrt(FLAT_SPREAD ** 2
+                          + (WALK_PER_DAY * math.sqrt(target_hours / 24.0)) ** 2)
+    return [round(min(max(inv_logit(mu + Z[t] * sigma), LOGIT_FLOOR), LOGIT_CAP), 4)
+            for t in (0.05, 0.25, 0.5, 0.75, 0.95)]
+
+
+def main():
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(output_dir, exist_ok=True)
+    case_id = None
+    for name in sorted(os.listdir(input_dir)):
+        if name.endswith(".in"):
+            case_id = name[:-3]
+            break
+    if case_id is None:
+        raise SystemExit("no case file in input dir")
+    with open(os.path.join(input_dir, case_id + ".in")) as f:
+        case = json.load(f)
+
+    target = parse_ts(case["target"])
+    target_hours = hours_since(target)
+    target_x = math.log1p(target_hours)
+    reads = [r for r in case["history"] if r.get("ok", True)]
+    trophies = case["trophies"]
+    rows = [forecast_trophy(reads, i, target_hours, target_x)
+            for i in range(len(trophies))]
+    out = {"trophies": [{"id": t["id"], "q": rows[i]}
+                        for i, t in enumerate(trophies)]}
+    with open(os.path.join(output_dir, case_id + ".out"), "w") as f:
+        json.dump(out, f)
 
 
 if __name__ == "__main__":
